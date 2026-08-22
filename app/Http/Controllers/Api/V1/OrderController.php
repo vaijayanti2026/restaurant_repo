@@ -790,14 +790,23 @@ class OrderController extends Controller
                 $earnedPoints = max(0, round($earningRate * (float) $orderAmount));
             }
 
-            $newBalance = max(0, $currentPoints - $redeemedPoints + $earnedPoints);
+            // Repeated order callbacks must not debit or credit rewards twice.
+            $orderDescription = '%order ID : ' . $orderId;
+            $existingTypes = DB::table('point_transitions')
+                ->where('user_id', $user->id)
+                ->where('description', 'like', $orderDescription)
+                ->pluck('type');
+
+            $redeemedPointsToApply = $existingTypes->contains('point_out') ? 0 : $redeemedPoints;
+            $earnedPointsToApply = $existingTypes->contains('point_in') ? 0 : $earnedPoints;
+            $newBalance = max(0, $currentPoints - $redeemedPointsToApply + $earnedPointsToApply);
 
             Log::info('Reward point balance update.', [
                 'user_id'          => $user->id,
                 'order_id'         => $orderId,
                 'current_points'   => $currentPoints,
-                'redeemed_points'  => $redeemedPoints,
-                'earned_points'    => $earnedPoints,
+                'redeemed_points'  => $redeemedPointsToApply,
+                'earned_points'    => $earnedPointsToApply,
                 'new_balance'      => $newBalance,
             ]);
 
@@ -808,23 +817,23 @@ class OrderController extends Controller
             // the write unconditionally.
             DB::table('users')->where('id', $user->id)->update(['point' => $newBalance]);
 
-            if ($redeemedPoints > 0) {
+            if ($redeemedPointsToApply > 0) {
                 DB::table('point_transitions')->insert([
                     'user_id'     => $user->id,
                     'description' => 'Redeemed points for order ID : ' . $orderId,
                     'type'        => 'point_out',
-                    'amount'      => $redeemedPoints,
+                    'amount'      => $redeemedPointsToApply,
                     'created_at'  => now(),
                     'updated_at'  => now(),
                 ]);
             }
 
-            if ($earnedPoints > 0) {
+            if ($earnedPointsToApply > 0) {
                 DB::table('point_transitions')->insert([
                     'user_id'     => $user->id,
                     'description' => 'Earned points for order ID : ' . $orderId,
                     'type'        => 'point_in',
-                    'amount'      => $earnedPoints,
+                    'amount'      => $earnedPointsToApply,
                     'created_at'  => now(),
                     'updated_at'  => now(),
                 ]);
@@ -832,7 +841,7 @@ class OrderController extends Controller
 
             return [
                 'balance'       => round($newBalance),
-                'earned_points' => $earnedPoints,
+                'earned_points' => $earnedPointsToApply,
                 'email'         => $user->email,
                 'customer_name' => trim($user->f_name . ' ' . $user->l_name),
             ];
