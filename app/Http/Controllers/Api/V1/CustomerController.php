@@ -200,7 +200,9 @@ class CustomerController extends Controller
                 ? Order::with('branch')->whereIn('id', $orderIds)->get()->keyBy('id')
                 : collect();
 
-            $runningBalance = (float) $request->user()->point;
+            // Start from the canonical balance stored on the user row. The
+            // authenticated model can be stale just after an order updates it.
+            $runningBalance = (float) (User::whereKey($request->user()->id)->value('point') ?? 0);
             $history = $transitions
                 ->map(function ($transition) use (&$runningBalance, $orders) {
                     $amount = abs((float) $transition->amount);
@@ -211,8 +213,10 @@ class CustomerController extends Controller
                     }
 
                     $transition->order_id = $orderId;
-                    $transition->points = $amount;
                     $transition->is_credit = $transition->type === 'point_in';
+                    // Debit values must be negative. The Flutter rewards UI also
+                    // uses this sign to select the green + or red - presentation.
+                    $transition->points = $transition->is_credit ? $amount : -$amount;
                     $transition->title = $transition->is_credit ? 'Points earned' : 'Points redeemed';
                     $transition->description = (string) $transition->description;
                     $transition->balance_after = round($runningBalance, 2);
