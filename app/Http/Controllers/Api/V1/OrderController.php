@@ -127,6 +127,27 @@ class OrderController extends Controller
                 }
 
                 if ($existingOrder) {
+                    if (
+                        $isSquarePayment
+                        && (
+                            $existingOrder->payment_method !== 'square'
+                            || (string) $existingOrder->user_id !== (string) $request->user()->id
+                            || (string) $existingOrder->branch_id !== (string) $request['branch_id']
+                        )
+                    ) {
+                        Log::warning('Square payment reference collision rejected.', [
+                            'transaction_reference' => $request->transaction_reference,
+                            'existing_order_id' => $existingOrder->id,
+                            'user_id' => optional($request->user())->id,
+                            'branch_id' => $request['branch_id'],
+                        ]);
+
+                        return response()->json(['errors' => [[
+                            'code' => 'square_reference_conflict',
+                            'message' => 'This Square payment reference is already associated with another order.',
+                        ]]], 409);
+                    }
+
                     Log::info('Duplicate order place request returned existing order.', [
                         'order_id' => $existingOrder->id,
                         'transaction_reference' => $request->transaction_reference,
@@ -213,7 +234,13 @@ class OrderController extends Controller
                 'updated_at' => $orderTimestamp,
             ];
 
+            if ($isSquarePayment && Schema::hasColumn('orders', 'payment_idempotency_key')) {
+                $or['payment_idempotency_key'] = $request->transaction_reference;
+            }
+
             $total_tax_amount = 0;
+            $pendingOrderDetails = [];
+            $pendingProductIds = [];
 
             foreach ($request['cart'] as $c) {
                 if (empty($c['product_id']) && $this->isRewardCartItem($c)) {
@@ -238,7 +265,7 @@ class OrderController extends Controller
                 $or_d = [
                     'order_id' => $order_id,
                     'product_id' => $c['product_id'],
-                    'product_details' => $product,
+                    'product_details' => $product->toJson(),
                     'quantity' => $c['quantity'],
                     'price' => $price,
                     'tax_amount' => Helpers::tax_calculate($product, $price),
@@ -254,8 +281,8 @@ class OrderController extends Controller
                 ];
 
                 $total_tax_amount += $or_d['tax_amount'] * $c['quantity'];
-                DB::table('order_details')->insert($or_d);
-                $product->increment('popularity_count');
+                $pendingOrderDetails[] = $or_d;
+                $pendingProductIds[] = $product->id;
             }
 
             $coupnText = '';
@@ -282,8 +309,30 @@ class OrderController extends Controller
                 $or['tip_price'] = $tipPrice;
             }
 
-            $o_id = DB::table('orders')->insertGetId($or);
-            $this->syncSelectedRewards($order_id, $selectedRewards);
+            // Insert the order first so the unique payment idempotency key wins
+            // before any detail, popularity, or reward side effects are written.
+            // The transaction also prevents partially-created local orders.
+            $o_id = DB::transaction(function () use (
+                $or,
+                $order_id,
+                $pendingOrderDetails,
+                $pendingProductIds,
+                $selectedRewards
+            ) {
+                $insertedOrderId = DB::table('orders')->insertGetId($or);
+
+                if (count($pendingOrderDetails) > 0) {
+                    DB::table('order_details')->insert($pendingOrderDetails);
+                }
+
+                foreach ($pendingProductIds as $productId) {
+                    Product::whereKey($productId)->increment('popularity_count');
+                }
+
+                $this->syncSelectedRewards($order_id, $selectedRewards);
+
+                return $insertedOrderId;
+            });
 
             if ($request->payment_method === 'square') {
                 app(SquareService::class)->attachLocalOrder(Order::find($order_id), $request->transaction_reference);
@@ -424,6 +473,35 @@ class OrderController extends Controller
                 'order_id' => $order_id
             ], 200);
 
+        } catch (\Illuminate\Database\QueryException $e) {
+            // The database unique key is the final guard when two callbacks pass
+            // the cache check concurrently. Return the winning order instead of
+            // creating a second order or showing a misleading payment failure.
+            if ($request->transaction_reference && (string) $e->getCode() === '23000') {
+                $existingOrder = Order::where('transaction_reference', $request->transaction_reference)->first();
+                if ($existingOrder) {
+                    Log::info('Concurrent duplicate callback returned existing order.', [
+                        'order_id' => $existingOrder->id,
+                        'transaction_reference' => $request->transaction_reference,
+                        'user_id' => optional($request->user())->id,
+                    ]);
+
+                    return response()->json([
+                        'message' => translate('order_success'),
+                        'order_id' => $existingOrder->id,
+                    ], 200);
+                }
+            }
+
+            Log::error('Order database write failed: ' . $e->getMessage(), [
+                'user_id' => optional($request->user())->id,
+                'transaction_reference' => $request->transaction_reference,
+            ]);
+
+            return response()->json(['errors' => [[
+                'code' => 'order_place_failed',
+                'message' => 'Unable to place order. Please try again.',
+            ]]], 500);
         } catch (\Throwable $e) {
             Log::error('Order place failed: ' . $e->getMessage(), [
                 'user_id' => optional($request->user())->id,
