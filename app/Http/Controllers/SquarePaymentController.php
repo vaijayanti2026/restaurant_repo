@@ -418,9 +418,21 @@ class SquarePaymentController extends Controller
 
         $square->markPaymentReferenceReturned($transaction_reference);
 
-        if (!$square->confirmCheckoutPaymentReference($transaction_reference, 3, 500000)) {
+        if (!$square->confirmCheckoutPaymentReference($transaction_reference, 6, 750000)) {
             Log::warning('Square checkout returned before Square payment confirmation was available.', [
                 'transaction_reference' => $transaction_reference,
+            ]);
+
+            // A browser redirect is not proof of payment. Never send the app to
+            // its success path until Square confirms a COMPLETED payment.
+            $pendingToken = base64_encode($token_string . '&&payment_status=pending');
+            if ($callback != null) {
+                return redirect($callback . '/fail?reason=payment_not_confirmed&token=' . $pendingToken);
+            }
+
+            return redirect()->route('payment-fail', [
+                'reason' => 'payment_not_confirmed',
+                'token' => $pendingToken,
             ]);
         }
 
