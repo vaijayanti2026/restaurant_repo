@@ -1,0 +1,24 @@
+name: PHP syntax checks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, fix/reward-balance-history]
+
+jobs:
+  php-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '7.4'
+          coverage: none
+      - name: Check changed payment and reward PHP files
+        run: |
+          php -l app/Http/Controllers/Api/V1/CustomerController.php
+          php -l app/Http/Controllers/Api/V1/OrderController.php
+          php -l app/Http/Controllers/Api/V1/RewardController.php
+          php -l app/Http/Controllers/SquarePaymentController.php
+          php -l database/migrations/2026_08_22_000001_add_square_payment_idempotency_constraints.php
